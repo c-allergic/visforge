@@ -7,163 +7,78 @@ import re
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
-from string import Formatter
 
+from .components import (DEFAULT_PLANNER_PROMPT, _MODEL_OPERATORS, _check_template, _nonempty, _template_body,
+                         composition_definitions, expand_template, operator_interfaces)
 from .dataset import normalize_question
 from .evaluation import h_s, score
 from .history import library_version, observer_history
-from .models import extract_json
 from .records import Candidate, QuestionView
+from .structured import OutputContract
 from .synthesis import generate
 from .verification import answer_blind, audit
 
 
-def _nonempty(value):
-    return isinstance(value, str) and bool(value.strip())
-
-
-def _symbol(value):
-    return isinstance(value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", value) is not None
-
-
-def _template_body(template):
-    """Compare execution order and dependencies independent of bookkeeping names."""
-    steps = template["steps"]
-    positions = {step["id"]: i for i, step in enumerate(steps)}
-    plan = [(step["op"], step.get("params", {}), [positions[s] for s in step.get("inputs", [])])
-            for step in steps]
-    return template["propose"], template["slots"], plan, template["question"], positions[template["answer_from"]]
-
-
-# Runtime input and result types for the implemented operators. Read values may
-# be numeric text; the numeric operators additionally check units at execution.
-_STEP_TYPES = {
-    "Select": ((), "list"),
-    "Identify": (({"list"},), "object"),
-    "Count": (({"object", "list"},), "numeric"),
-    "Exists": (({"list"},), "boolean"),
-    "Locate": (({"object"}, {"object"}), "text"),
-    "FindPartner": (({"object"},), "object"),
-    "Read": (({"object"},), "read_value"),
-    "Compare": (({"numeric", "read_value"}, {"numeric", "read_value"}), "text"),
-    "Extreme": (({"list"},), "object"),
-    "Calculate": (({"numeric", "read_value"}, {"numeric", "read_value"}), "numeric"),
-    "Match": (({"object"}, {"list"}), "object"),
+_EDIT_FORMS = {
+    "add_template": {"template": "name, propose, slots, steps, question, answer_from"},
+    "update_template": {"name": "existing template", "changes": "object with changed template fields"},
+    "remove_template": {"name": "existing template"},
+    "set_planner_prompt": {"prompt": "replacement instruction for how to rank and choose image bindings"},
+    "modify": {"name": "active model operator", "prompt": "replacement instruction", "description": "optional"},
+    "add_composition": {"operator": "name, description, inputs, slots, steps, answer_from, result"},
+    "batch": {"edits": "ordered list of 1 to 6 dependent edits"},
 }
-_MODEL_OPERATORS = {"Select", "Exists", "FindPartner", "Read", "Extreme", "Match"}
-_TEXT_PARAMS = {"Select": {"description"}, "Identify": {"distinguisher"}, "Read": {"what"},
-                "Extreme": {"field"}, "Exists": {"description"}}
-_ENUM_PARAMS = {"Locate": ("axis", ("horizontal", "vertical")), "Extreme": ("direction", ("max", "min")),
-                "Calculate": ("op", ("+", "-", "*", "/"))}
+_OBSERVER_OUTPUT = OutputContract({"action": "batch"}, fields={"action": str})
 
 
-def _parameter_slots(op, params, slots):
-    text_keys = _TEXT_PARAMS.get(op, set())
-    extra = {"Select": {"require_unique", "allow_empty"}, "Read": {"scale"}, "Compare": {"labels"}}.get(op, set())
-    enum = _ENUM_PARAMS.get(op)
-    if not isinstance(params, dict) or params.keys() - (text_keys | extra | ({enum[0]} if enum else set())):
-        raise ValueError(f"unsupported {op} parameters")
-    if enum and enum[0] in params and params[enum[0]] not in enum[1]:
-        raise ValueError(f"unsupported {op} {enum[0]}")
-    if op == "Select":
-        if "description" not in params or any(type(params.get(k, False)) is not bool for k in extra):
-            raise ValueError("Select needs a description and boolean selection controls")
-        if params.get("require_unique") and params.get("allow_empty"):
-            raise ValueError("a unique object selection cannot also allow an empty list")
-    if op == "Read":
-        scale = params.get("scale", 3)
-        if type(scale) not in (float, int) or not 0 < scale <= 4:
-            raise ValueError("Read scale must be positive and at most 4")
-    values = [params[k] for k in text_keys if k in params]
-    if op == "Compare" and "labels" in params:
-        labels = params["labels"]
-        if not isinstance(labels, list) or len(labels) != 2:
-            raise ValueError("Compare labels must be a pair of strings")
-        values.extend(labels)
-    used = set()
-    for value in values:
-        if not _nonempty(value):
-            raise ValueError(f"{op} text parameters must be nonempty")
-        if "{" in value or "}" in value:
-            if value not in {"${" + slot + "}" for slot in slots}:
-                raise ValueError("operator parameter placeholders must have the form ${slot}")
-            used.add(value[2:-1])
-    return used
-
-
-def _check_template(template, library):
-    required = {"name", "propose", "slots", "steps", "question", "answer_from"}
-    if not isinstance(template, dict) or set(template) != required:
-        raise ValueError("template fields must be " + ", ".join(sorted(required)))
-    name = template["name"]
-    if not _nonempty(name) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
-        raise ValueError("invalid template name")
-    for other in library.get("templates", []):
-        if name == other["name"]:
-            raise ValueError("template name already exists")
-    if not _nonempty(template["propose"]) or not _nonempty(template["question"]):
-        raise ValueError("template needs a proposal instruction and question")
-    slots = template["slots"]
-    if not isinstance(slots, list) or not slots or not all(map(_symbol, slots)) or len(slots) != len(set(slots)):
-        raise ValueError("slots must be unique identifiers")
-    used_slots = set()
-    for literal, field, spec, conversion in Formatter().parse(template["question"]):
-        if field is not None:
-            if field not in slots or spec or conversion or literal.endswith("$"):
-                raise ValueError("question placeholders must have the form {slot}")
-            used_slots.add(field)
-    if not used_slots:
-        raise ValueError("question must reference a declared proposal slot")
-    steps = template["steps"]
-    if not isinstance(steps, list) or not steps:
-        raise ValueError("template needs execution steps")
-    available = {op["name"] for op in library["operators"]}
-    types, consumed = {}, set()
-    for step in steps:
-        if not isinstance(step, dict) or not _symbol(step.get("id")) or step["id"] in types:
-            raise ValueError("step requires a unique identifier")
-        if set(step) - {"id", "op", "inputs", "params"}:
-            raise ValueError("unsupported step field")
-        op = step.get("op")
-        if not isinstance(op, str) or op not in available or op not in _STEP_TYPES:
-            raise ValueError("unknown or unavailable operator")
-        inputs = step.get("inputs", [])
-        expected, result = _STEP_TYPES[op]
-        if (not isinstance(inputs, list) or len(inputs) != len(expected)
-                or any(not _symbol(ref) or types.get(ref) not in allowed for ref, allowed in zip(inputs, expected))):
-            raise ValueError(f"{op} inputs must reference compatible earlier steps")
-        if len(set(inputs)) != len(inputs):
-            raise ValueError("binary operations require two distinct inputs")
-        params = step.get("params", {})
-        used_slots.update(_parameter_slots(op, params, slots))
-        types[step["id"]] = "object" if op == "Select" and params.get("require_unique") else result
-        consumed.update(inputs)
-    answer_from = template["answer_from"]
-    if (not _symbol(answer_from) or types.keys() - consumed != {answer_from}
-            or types[answer_from] == "list"):
-        raise ValueError("every step must contribute to a single answer_from result")
-    if used_slots != set(slots):
-        raise ValueError("every declared slot must be used")
-    body = _template_body(template)
-    if any(body == _template_body(other) for other in library.get("templates", [])):
-        raise ValueError("renaming an existing template or its steps does not change generation")
-
-
-def apply_edit(library, edit, *, budget=None):
-    """Return a copy with one executable edit. All templates remain available to the per-image planner."""
-    new = copy.deepcopy(library)
-    templates = new.get("templates", [])
-    if not isinstance(edit, dict) or (budget is not None and budget < 1):
-        raise ValueError("an executable edit and positive attempt budget are required")
+def _apply_one(new, edit):
+    action = edit.get("action") if isinstance(edit, dict) else None
+    if not isinstance(action, str) or action not in _EDIT_FORMS or action == "batch":
+        raise ValueError("edit must use a supported action")
+    if edit.keys() - ({"action", "hypothesis"} | _EDIT_FORMS[action].keys()):
+        raise ValueError(f"unsupported fields for {action}")
+    templates = new.setdefault("templates", [])
+    if action == "add_composition":
+        operator = edit.get("operator")
+        if not isinstance(operator, dict) or "steps" not in operator:
+            raise ValueError("add_composition requires an executable operator definition")
+        new["operators"].append(operator)
+        composition_definitions(new)
+        return
+    if action == "set_planner_prompt":
+        prompt = edit.get("prompt")
+        if not _nonempty(prompt) or len(prompt.strip()) > 2800:
+            raise ValueError("planner prompt must have 1 to 2800 characters")
+        if prompt.strip() == new.get("planner_prompt", DEFAULT_PLANNER_PROMPT):
+            raise ValueError("edit must change the planner prompt")
+        new["planner_prompt"] = prompt.strip()
+        return
     if edit.get("action") == "add_template":
         template = edit.get("template")
         _check_template(template, new)
-        new.setdefault("templates", []).append(copy.deepcopy(template))
-        return new
-    if edit.get("action") != "modify":
-        raise ValueError("supported edit actions are add_template and modify")
+        templates.append(template)
+        return
     name = edit.get("name")
-    active = {step["op"] for tpl in templates for step in tpl["steps"]}
+    if action in ("update_template", "remove_template"):
+        index = next((index for index, item in enumerate(templates) if item["name"] == name), None)
+        if index is None:
+            raise ValueError("edit must name an existing template")
+        original = templates.pop(index)
+        if action == "remove_template":
+            if not templates:
+                raise ValueError("the planner needs at least one template")
+            return
+        changes = edit.get("changes")
+        if not isinstance(changes, dict) or not changes or changes.keys() - (original.keys() - {"name"}):
+            raise ValueError("update_template needs changes to existing fields other than name")
+        revised = {**original, **changes}
+        _check_template(revised, new)
+        if _template_body(revised) == _template_body(original):
+            raise ValueError("edit must change the template")
+        templates.insert(index, revised)
+        return
+    compositions = composition_definitions(new)
+    active = {step["op"] for tpl in templates for step in expand_template(tpl, compositions)["steps"]}
     if not isinstance(name, str) or name not in _MODEL_OPERATORS or name not in active:
         raise ValueError("operator must use its prompt in a library template")
     op = next((op for op in new["operators"] if op["name"] == name), None)
@@ -176,6 +91,31 @@ def apply_edit(library, edit, *, budget=None):
             raise ValueError("operator description must be text")
         if edit["description"].strip():
             op["description"] = edit["description"].strip()
+
+
+def apply_edit(library, edit, *, budget=None):
+    """Apply an edit or ordered batch atomically, then check that new operators can be executed."""
+    if not isinstance(edit, dict) or (budget is not None and budget < 1):
+        raise ValueError("an executable edit and positive attempt budget are required")
+    if "hypothesis" in edit and not _nonempty(edit["hypothesis"]):
+        raise ValueError("hypothesis must be nonempty text")
+    edits = edit.get("edits") if edit.get("action") == "batch" else [edit]
+    if (not isinstance(edits, list) or not 1 <= len(edits) <= 6
+            or (edit.get("action") == "batch" and edit.keys() - {"action", "edits", "hypothesis"})):
+        raise ValueError("batch requires an ordered list of 1 to 6 edits")
+    new = copy.deepcopy(library)
+    for change in copy.deepcopy(edits):
+        _apply_one(new, change)
+    compositions = composition_definitions(new)
+    added = set(compositions) - set(composition_definitions(library))
+    if added:
+        used = {parent["op"] for template in new["templates"]
+                for step in expand_template(template, compositions)["steps"]
+                for parent in step.get("compositions", [])}
+        if added - used:
+            raise ValueError(f"new compositions need a calling template: {', '.join(sorted(added - used))}")
+    if new == library:
+        raise ValueError("edit must change the executable library")
     return new
 
 
@@ -187,9 +127,7 @@ def _observer_edit(text, library, budget):
     if re.fullmatch(r"no[ _-]edit(?:[.!:]\s*.*)?", reply, re.IGNORECASE | re.DOTALL):
         return None
     short = re.fullmatch(r"SELECT_PROMPT:[ \t]*(.+)", reply, re.IGNORECASE)
-    edit = {"action": "modify", "name": "Select", "prompt": short[1]} if short else extract_json(reply)
-    if not isinstance(edit, dict):
-        raise ValueError("expected one complete JSON object, SELECT_PROMPT: <instruction>, or NO_EDIT")
+    edit = {"action": "modify", "name": "Select", "prompt": short[1]} if short else _OBSERVER_OUTPUT.parse(reply)
     if edit.get("action") == "no_edit":
         return None
     if edit.get("action") == "read_object":
@@ -279,26 +217,21 @@ def _observer_summary(records):
 def propose_edit(library, records, model, *, budget=None, on_response=None, repair=False,
                  history=(), rejected=None):
     """Record each local response and optionally request one correction of invalid output."""
-    templates = [{"name": tpl["name"], "question": tpl["question"], "slots": tpl["slots"],
-                  "steps": tpl["steps"]} for tpl in sorted(library["templates"], key=lambda x: x["name"])]
-    operators = {op["name"]: {"description": op.get("description", ""),
-                              "editable_prompt": op.get("prompt") if op["name"] in _MODEL_OPERATORS else None,
-                              "inputs": [sorted(types) for types in _STEP_TYPES[op["name"]][0]],
-                              "result": _STEP_TYPES[op["name"]][1]}
-                 for op in library["operators"] if op["name"] in _STEP_TYPES}
+    templates = sorted(library["templates"], key=lambda x: x["name"])
+    operators = operator_interfaces(library)
     prompt = (
         "You are the rule-library observer. Study the development results below. Design one reusable "
         "change to make valid questions harder for the fixed target solver while preserving visual "
         "answerability and verified yield. Correct observed failure modes using concrete evidence. "
-        "Reply directly in one of these forms:\n"
-        '1. Choose a new Select -> Read composition by returning a compact object, e.g. '
-        '{"action":"read_object","name":"heading-read","propose":"Pick a unique titled region and describe its '
-        'location without revealing its text.","what":"the region heading","question":"What heading is printed '
-        'in {target}?"}. Supply your own name and wording for the observed batch. Keep {target} in the question.\n'
-        "2. To change Select, write one line starting with SELECT_PROMPT: followed by your replacement instruction. "
-        "The runtime already appends the object-list JSON and bounding-box schema.\n"
-        '3. To retain the rules, reply NO_EDIT. Standard JSON actions modify or add_template are also accepted.\n'
+        "Return one JSON object with an action and a short hypothesis tied to the observed evidence, or reply NO_EDIT. "
+        "Use a batch when component changes depend on each other. Declare a composition before its caller. "
+        "Composition inputs are an ordered list of {id, type} ports, slots are textual parameters, "
+        "and steps have id, op, optional inputs and params. Bind parameter references as ${slot} "
+        "and question references as {slot}. Connect each input and step to answer_from. "
+        "Use a calling template to make a new composition available to the planner.\n"
+        f"Edit actions and their fields: {json.dumps(_EDIT_FORMS, ensure_ascii=False)}\n"
         f"All candidate templates (the image planner may select any, up to {budget} bindings): {json.dumps(templates, ensure_ascii=False)}\n"
+        f"Current planner strategy: {json.dumps(library.get('planner_prompt', DEFAULT_PLANNER_PROMPT), ensure_ascii=False)}\n"
         f"Current operator prompts: {json.dumps(operators, ensure_ascii=False)}"
         + (observer_history(history, library) if history else "")
         + "\n"
@@ -306,7 +239,7 @@ def propose_edit(library, records, model, *, budget=None, on_response=None, repa
     )
     request = prompt
     for index in range(1, 3 if repair else 2):
-        text, meta = model({"text": request, "generation_diagnostics": True, "max_new_tokens": 1024})
+        text, meta = model({"text": request, "generation_diagnostics": True, "max_new_tokens": 2048})
         raw = text if isinstance(text, str) else ""
         try:
             edit = _observer_edit(raw, library, budget)
@@ -324,8 +257,7 @@ def propose_edit(library, records, model, *, budget=None, on_response=None, repa
         if outcome not in ("invalid", "repeated"):
             return edit
         request = (f"{prompt}\nYour previous proposal could not proceed: {error}. "
-                   f"Previous reply: {raw[:1000]}\nReturn one corrected choice now. "
-                   "The one-line SELECT_PROMPT form is enough for a prompt change.")
+                   f"Previous reply: {raw[:1000]}\nReturn one corrected edit now.")
     return None
 
 

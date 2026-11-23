@@ -39,17 +39,27 @@ def history_entry(directory, state, initial, selected, *, candidate=None, compar
             "cohorts": {key: state["pinned_files"].get(key) for key in ("development.csv", "holdout.csv")},
         },
     }
-    if edit and edit.get("action") == "add_template" and "new" in comparison:
-        name = edit["template"]["name"]
+    if edit and "new" in comparison:
+        edits = edit["edits"] if edit["action"] == "batch" else [edit]
+        templates = [change["template"]["name"] for change in edits if change["action"] == "add_template"]
+        templates += [change["name"] for change in edits if change["action"] == "update_template"]
+        compositions = [change["operator"]["name"] for change in edits if change["action"] == "add_composition"]
         arm = comparison["new"]
-        accepted = [row for row in arm.get("records", []) if row["template"] == name and row["status"] == "accepted"]
-        report["added_template"] = {
-            "name": name,
-            "attempts": sum(row["summary"].get(name, {}).get("attempts", 0) for row in arm.get("selections", [])),
-            "accepted": len(accepted),
-            "target_correct": sum(sum(row["target_correct"]) for row in accepted),
-            "target_samples": sum(len(row["target_correct"]) for row in accepted),
-        }
+        if templates:
+            report["templates"] = {}
+        for name in dict.fromkeys(templates):
+            accepted = [row for row in arm["records"] if row["template"] == name and row["status"] == "accepted"]
+            report["templates"][name] = {
+                "attempts": sum(row["summary"].get(name, {}).get("attempts", 0) for row in arm["selections"]),
+                "accepted": len(accepted),
+                "target_correct": sum(sum(row["target_correct"]) for row in accepted),
+                "target_samples": sum(len(row["target_correct"]) for row in accepted),
+            }
+        if compositions:
+            report["composition_attempts"] = {
+                name: sum(row.get("operator_attempts", {}).get(name, 0) for row in arm["selections"])
+                for name in compositions
+            }
     return report
 
 
@@ -81,7 +91,8 @@ def load_previous(directory):
 def observer_history(history, initial):
     parent = library_version(initial)
     ordered = sorted(reversed(history), key=lambda row: row["parent_version"] != parent)
-    notes = [{key: row[key] for key in ("run", "status", "reason", "edit", "metrics", "added_template") if key in row}
+    fields = ("run", "status", "reason", "edit", "metrics", "added_template", "templates", "composition_attempts")
+    notes = [{key: row[key] for key in fields if key in row}
              for row in ordered[:6]]
     return ("\nUse these prior outcomes to choose a different, testable change. "
             "Treat scores as evidence from the recorded run.\nPrior evolution results: "

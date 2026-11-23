@@ -4,6 +4,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from .components import DEFAULT_PLANNER_PROMPT, _fill_slots, composition_definitions, expand_template
 from .dataset import dedup_key
 from .models import extract_json, response_excerpt
 from .operators import OperatorResult, apply_operator
@@ -15,20 +16,6 @@ def _find_operator(library, name):
         if op.get("name") == name:
             return op
     return None
-
-
-def _fill_slots(params, proposal):
-    """把参数里的 "${槽位}" 换成出题模型的提议（含嵌套 list/dict）。"""
-    def fill(value):
-        if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
-            return proposal.get(value[2:-1], value)
-        if isinstance(value, list):
-            return [fill(item) for item in value]
-        if isinstance(value, dict):
-            return {key: fill(item) for key, item in value.items()}
-        return value
-
-    return {key: fill(value) for key, value in params.items()}
 
 
 def _binding_error(choice, templates):
@@ -50,7 +37,7 @@ def _binding_key(choice):
     ))
 
 
-def _select_bindings(model, image, templates, library, budget, instances):
+def _select_bindings(model, image, templates, library, budget, instances, execution_plans):
     names = sorted(templates)
     trace = {"status": "skipped", "available_templates": names, "budget": budget,
              "instances_per_template": instances, "selected_templates": [], "choices": [], "issues": []}
@@ -65,15 +52,23 @@ def _select_bindings(model, image, templates, library, budget, instances):
                         for step in tpl["steps"]]
         row["operators"] = [step["op"] for step in tpl["steps"]]
         used_operators.update(row["operators"])
+        expanded = execution_plans[name]
+        if any("compositions" in step for step in expanded["steps"]):
+            row["expanded_steps"] = expanded["steps"]
+            row["expanded_answer_from"] = expanded["answer_from"]
+            for step in expanded["steps"]:
+                used_operators.add(step["op"])
+                used_operators.update(parent["op"] for parent in step.get("compositions", []))
         catalog.append(row)
     definitions = []
     for name in sorted(used_operators):
         op = _find_operator(library, name)
         if op is not None:
-            definitions.append({key: op[key] for key in ("name", "description", "guard", "guards", "prompt") if key in op})
+            keys = ("name", "description", "guard", "guards", "prompt", "inputs", "slots", "result")
+            definitions.append({key: op[key] for key in keys if key in op})
     prompt = (
         "You are writing questions from an image. Examine the image and choose from the entire template library. "
-        "Rank concrete bindings by the visible evidence that their full operator chains can succeed. "
+        + library.get("planner_prompt", DEFAULT_PLANNER_PROMPT) + " "
         "Respect operator requirements, step parameters and the order of each step's inputs. "
         "Choose different applicable templates and targets before repeating a template. Use distinct objects, "
         "groups, comparisons or text regions for additional bindings. Do not guess answers or invent evidence. "
@@ -199,6 +194,8 @@ def _run_template(tpl, image, library, model, proposal):
                 "failure_reason": "" if result.ok else result.failure_reason,
             }
         )
+        if "compositions" in step:
+            plan[-1]["compositions"] = step["compositions"]
         if not result.ok:
             failure = {"step": step["id"], "operator": step["op"], "reason": result.failure_reason}
             if result.diagnostic is not None:
@@ -236,6 +233,8 @@ def generate(image_path, library, settings):
     templates = {tpl["name"]: tpl for tpl in catalog}
     if len(templates) != len(catalog):
         raise ValueError("template names must be unique for image planning")
+    compositions = composition_definitions(library)
+    execution_plans = {name: expand_template(tpl, compositions) for name, tpl in templates.items()}
     instances = max(1, int(settings.get("instances_per_template", 3)))
     budget = len(templates) * instances
     if settings.get("budget") is not None:
@@ -244,7 +243,7 @@ def generate(image_path, library, settings):
         selection = settings["frozen_selection"]
         _check_frozen(selection, templates, budget, instances)
     else:
-        selection = _select_bindings(model, image, templates, library, budget, instances)
+        selection = _select_bindings(model, image, templates, library, budget, instances, execution_plans)
         if settings.get("on_selection") is not None:
             settings["on_selection"](selection)
     candidates, failures, summary = [], [], {}
@@ -258,8 +257,10 @@ def generate(image_path, library, settings):
         name = choice["template"]
         counts = summary.setdefault(name, {"attempts": 0, "candidates": 0, "failures": 0})
         counts["attempts"] += 1
-        composed, plan, failure = _run_template(templates[name], image, library, model, choice["slots"])
+        composed, plan, failure = _run_template(execution_plans[name], image, library, model, choice["slots"])
         operator_attempts.update(step["op"] for step in plan[1:])
+        invoked = {entry["id"]: entry["op"] for step in plan[1:] for entry in step.get("compositions", [])}
+        operator_attempts.update(invoked.values())
         if composed is None:
             failures.append({"template": name, "selection_rank": choice["rank"], **failure})
             counts["failures"] += 1
