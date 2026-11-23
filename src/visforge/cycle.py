@@ -11,7 +11,7 @@ from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
-from . import evolution, models
+from . import evolution, history, models
 from .evaluation import make_judge
 from .operators import seed_library
 from .records import QuestionView
@@ -100,9 +100,12 @@ def _prepare(args, out):
         setup["holdout_mix"] = args.holdout_mix
     if args.reuse_development_for_comparison:
         setup["comparison_population"] = "in_sample"
+    prior = Path(args.resume_from).resolve() if args.resume_from else None
     statefile = out / "run.json"
     if statefile.exists():
         state = json.loads(statefile.read_text())
+        if prior is not None and state.get("prior_run") != str(prior):
+            raise ValueError("Run already pins a different starting version and history.")
         if state["settings"].get("selection_policy") != evolution.SELECTION_POLICY:
             raise ValueError("Existing run used a different selection policy; preserve it and use another --out.")
         can_retry = state["status"] in ("interrupted", "running", "retrying_observer")
@@ -129,6 +132,7 @@ def _prepare(args, out):
         raise ValueError("Observer retry requires an existing run.")
     if any(out.iterdir()):
         raise ValueError("Choose an empty run directory.")
+    initial, previous = history.load_previous(prior) if prior is not None else (seed_library(), [])
     sides = _split_rows(manifest, args)
     for name, rows in sides.items():
         with (out / f"{name}.csv").open("w", newline="", encoding="utf-8") as stream:
@@ -139,9 +143,10 @@ def _prepare(args, out):
                 purpose = "in_sample_comparison" if name == "holdout" and args.reuse_development_for_comparison else name
                 writer.writerow({**row, "path": os.path.relpath(row["path"], out), "purpose": purpose})
         load_seeds(out / f"{name}.csv")
-    _write_json(out / "initial-library.json", seed_library())
+    _write_json(out / "initial-library.json", initial)
+    _write_json(out / "initial-history.json", previous)
     pinned = {name: hashlib.sha256((out / name).read_bytes()).hexdigest()
-              for name in ("initial-library.json", "development.csv", "holdout.csv")}
+              for name in ("initial-library.json", "initial-history.json", "development.csv", "holdout.csv")}
     attempts = args.budget
     # Per candidate: two audit calls, plus at most one target-equivalence call.
     # Each holdout arm also has a reference solve and possible equivalence call.
@@ -149,6 +154,7 @@ def _prepare(args, out):
     if args.reuse_development_for_comparison:
         limit = attempts * 10 * len(sides["development"])
     state = dict(status="prepared", settings=setup, pinned_files=pinned,
+                 prior_run=str(prior) if prior is not None else None, initial_version=history.library_version(initial),
                  external_call_upper_bound=limit, external_call_bound_excludes_retries=True,
                  images={name: len(rows) for name, rows in sides.items()})
     _write_json(statefile, state)
@@ -372,6 +378,8 @@ def _write_dataset(out, name, metrics):
 
 def _execute(args, out, state, roles, drafts, frozen=None):
     initial = json.loads((out / "initial-library.json").read_text())
+    history_path = out / "initial-history.json"
+    previous = json.loads(history_path.read_text()) if history_path.exists() else []
     holdout = load_seeds(out / "holdout.csv")
     scoped_verifier = _verifier_for_phase(out, state, roles["verifier"])
     settings = dict(model=roles["synthesis"], solver=roles["target"], min_coverage=1,
@@ -395,6 +403,7 @@ def _execute(args, out, state, roles, drafts, frozen=None):
         state["pinned_files"][name] = hashlib.sha256((out / name).read_bytes()).hexdigest()
 
     selected = initial
+    candidate = comparison = edit = None
     chosen_metrics, chosen_arm, chosen_split = dev, "old", "development"
     state["verified_development_questions"] = dev["accepted"]
     if not dev["accepted"]:
@@ -412,7 +421,8 @@ def _execute(args, out, state, roles, drafts, frozen=None):
             edit = json.loads((out / "proposed-edit.json").read_text())
         else:
             edit = evolution.propose_edit(initial, observations, roles["observer"], budget=args.budget,
-                                          repair=True, on_response=on_response)
+                                          repair=True, on_response=on_response, history=previous,
+                                          rejected=history.rejected_candidates(previous, state, initial))
             state["observer_outcome"] = diagnostics[-1]["outcome"]
             _write_json(out / "proposed-edit.json", edit)
             name = "proposed-edit.json"
@@ -447,6 +457,13 @@ def _execute(args, out, state, roles, drafts, frozen=None):
     state["selected_data"] = {"path": "selected-data.jsonl", "library": chosen_arm,
                               "scope": chosen_split, "questions": chosen_metrics["accepted"]}
     _write_json(out / "selected-library.json", selected)
+    entry = history.history_entry(out, state, initial, selected, candidate=candidate, comparison=comparison, edit=edit)
+    if entry["reason"] is None and edit is None and dev["accepted"]:
+        responses = json.loads((out / "observer-responses.json").read_text())
+        entry["reason"] = responses[-1]["validation_error"]
+    _write_json(out / "evolution-history.json", {"schema_version": 1, "current_version": entry["selected_version"],
+                                                "entries": [*previous, entry]})
+    state["selected_version"] = entry["selected_version"]
     _write_json(out / "run.json", state)
 
 

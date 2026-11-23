@@ -70,6 +70,34 @@ def test_entire_cycle_writes_verified_development_data_and_decision(tmp_path, mo
         main(args)
 
 
+def test_followup_inherits_selection_and_reuses_rejection_evidence(tmp_path, monkeypatch):
+    from fakes import FakeModel, generation_model, solver_model
+    from visforge import models
+
+    first, followup = tmp_path / "first", tmp_path / "followup"
+    path = manifest(tmp_path)
+    edit = {"action": "modify", "name": "Select",
+            "prompt": "Carefully list all objects matching the description."}
+    observer = FakeModel(default=json.dumps(edit))
+    verifier = generation_model()
+    verifier.add("Answer the following question", lambda r: "2" if "How many" in r["text"] else "TEA")
+    verifier.add("equivalent", '{"equivalent": false}')
+    roles = dict(synthesis=generation_model(), target=solver_model(), observer=observer, verifier=verifier)
+    monkeypatch.setattr(models, "build_cycle_models", lambda *a, **kw: roles)
+    base = ["cycle", "--manifest", str(path), "--model-path", str(tmp_path), "--verifier-model", "fake"]
+
+    main(base + ["--out", str(first)])
+    main(base + ["--out", str(followup), "--resume-from", str(first), "--prepare-only"])
+    assert (first / "selected-library.json").read_bytes() == (followup / "initial-library.json").read_bytes()
+    main(base + ["--out", str(followup)])
+    history = json.loads((followup / "evolution-history.json").read_text())
+    assert [entry["status"] for entry in history["entries"]] == ["retained", "no_usable_edit"]
+    assert history["entries"][0]["edit"] == edit
+    assert "h_s not improved" in observer.calls[-2]["text"]
+    assert "already evaluated" in observer.calls[-1]["text"]
+    assert not (followup / "new-drafts.json").exists()
+
+
 def test_duplicate_pixels_cannot_cross_split(tmp_path):
     path = manifest(tmp_path)
     for img in tmp_path.glob("*.png"):

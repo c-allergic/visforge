@@ -115,6 +115,7 @@ def build_parser():
     p = sub.add_parser("cycle", help="Run one library update with local Qwen and an external visual verifier")
     p.add_argument("--manifest", required=True, help="Seed CSV with path, kind and source group")
     p.add_argument("--out", required=True, help="Empty or previously prepared run directory")
+    p.add_argument("--resume-from", help="Start a new cycle from a completed run's selected library and proposal history")
     stage = p.add_mutually_exclusive_group()
     stage.add_argument("--prepare-only", action="store_true", help="Pin and check images without calling a model")
     stage.add_argument("--draft-only", action="store_true", help="Save local development candidates and blind target answers")

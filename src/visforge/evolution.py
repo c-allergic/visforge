@@ -11,6 +11,7 @@ from string import Formatter
 
 from .dataset import normalize_question
 from .evaluation import h_s, score
+from .history import library_version, observer_history
 from .models import extract_json
 from .records import Candidate, QuestionView
 from .synthesis import generate
@@ -275,7 +276,8 @@ def _observer_summary(records):
                        "source_routes": image_routes, "examples": picked}, ensure_ascii=False)
 
 
-def propose_edit(library, records, model, *, budget=None, on_response=None, repair=False):
+def propose_edit(library, records, model, *, budget=None, on_response=None, repair=False,
+                 history=(), rejected=None):
     """Record each local response and optionally request one correction of invalid output."""
     templates = [{"name": tpl["name"], "question": tpl["question"], "slots": tpl["slots"],
                   "steps": tpl["steps"]} for tpl in sorted(library["templates"], key=lambda x: x["name"])]
@@ -297,7 +299,9 @@ def propose_edit(library, records, model, *, budget=None, on_response=None, repa
         "The runtime already appends the object-list JSON and bounding-box schema.\n"
         '3. To retain the rules, reply NO_EDIT. Standard JSON actions modify or add_template are also accepted.\n'
         f"All candidate templates (the image planner may select any, up to {budget} bindings): {json.dumps(templates, ensure_ascii=False)}\n"
-        f"Current operator prompts: {json.dumps(operators, ensure_ascii=False)}\n"
+        f"Current operator prompts: {json.dumps(operators, ensure_ascii=False)}"
+        + (observer_history(history, library) if history else "")
+        + "\n"
         f"Development results: {_observer_summary(records)}"
     )
     request = prompt
@@ -307,14 +311,19 @@ def propose_edit(library, records, model, *, budget=None, on_response=None, repa
         try:
             edit = _observer_edit(raw, library, budget)
             outcome, error = ("edit" if edit is not None else "declined"), None
+            if edit is not None and rejected:
+                version = library_version(apply_edit(library, edit, budget=budget))
+                if version in rejected:
+                    edit, outcome = None, "repeated"
+                    error = f"This candidate was already evaluated on the same protocol and rejected: {rejected[version]}"
         except ValueError as exc:
             edit, outcome, error = None, "invalid", str(exc)
         if on_response is not None:
             on_response({"index": index, "raw": raw[:8192], "raw_truncated": len(raw) > 8192,
                          "model": (meta or {}).get("model"), "outcome": outcome, "validation_error": error})
-        if outcome != "invalid":
+        if outcome not in ("invalid", "repeated"):
             return edit
-        request = (f"{prompt}\nYour previous response was invalid: {error}. "
+        request = (f"{prompt}\nYour previous proposal could not proceed: {error}. "
                    f"Previous reply: {raw[:1000]}\nReturn one corrected choice now. "
                    "The one-line SELECT_PROMPT form is enough for a prompt change.")
     return None
