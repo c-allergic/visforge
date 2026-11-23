@@ -98,6 +98,51 @@ def test_followup_inherits_selection_and_reuses_rejection_evidence(tmp_path, mon
     assert not (followup / "new-drafts.json").exists()
 
 
+def test_cycle_scores_verified_questions_with_the_external_target_and_local_reference(tmp_path, monkeypatch):
+    from fakes import FakeModel, generation_model
+    from visforge import models
+
+    source, out = manifest(tmp_path), tmp_path / "run"
+    args = ["cycle", "--manifest", str(source), "--out", str(out), "--model-path", str(tmp_path),
+            "--verifier-model", "luna", "--target-model", "DeepSeek-V4.1-Flash",
+            "--reuse-development-for-comparison"]
+    local = generation_model()
+    remote_requests = []
+
+    def target(request):
+        remote_requests.append(request)
+        if len(remote_requests) == 2:
+            raise RuntimeError("target interrupted")
+        return "1", {"model": "DeepSeek-V4.1-Flash", "usage": {"prompt_tokens": 8}}
+
+    verifier = generation_model()
+    verifier.add("Answer the following question", "2")
+    verifier.add("equivalent", '{"equivalent": false}')
+    local.add("Answer the following question", lambda req: "2" if "How many" in req["text"] else "TEA")
+    edit = {"action": "modify", "name": "Select",
+            "prompt": "Carefully list all objects matching the description."}
+    roles = dict(synthesis=local, target=target, reference=local, verifier=verifier,
+                 observer=FakeModel(default=json.dumps(edit)))
+    monkeypatch.setattr(models, "make_local_model", lambda *a, **kw: local)
+    monkeypatch.setattr(models, "build_cycle_models", lambda *a, **kw: roles)
+    main(args + ["--draft-only"])
+    assert not remote_requests
+    assert all("target_answers" not in row for image in json.loads((out / "development-drafts.json").read_text())
+               for row in image["candidates"])
+    with pytest.raises(RuntimeError, match="target interrupted"):
+        main(args)
+    main([*args[:-3], "--reuse-development-for-comparison"])
+    comparison = json.loads((out / "comparison.json").read_text())
+    accepted = [row for arm in ("old", "new") for row in comparison[arm]["records"] if row["status"] == "accepted"]
+    assert accepted and all(row["target_models"] == ["DeepSeek-V4.1-Flash"] and row["reference_models"] == ["fake"]
+                            for row in accepted)
+    assert len(remote_requests) == 1 + len(accepted)
+    assert all(set(req) == {"text", "images"} and len(req["images"]) == 1 for req in remote_requests)
+    state = json.loads((out / "run.json").read_text())
+    assert state["settings"]["target_model"] == "DeepSeek-V4.1-Flash"
+    assert state["target_usage"]["responses"] == len(accepted)
+
+
 def test_duplicate_pixels_cannot_cross_split(tmp_path):
     path = manifest(tmp_path)
     for img in tmp_path.glob("*.png"):
@@ -324,18 +369,18 @@ def test_interrupted_operator_reuses_checkpointed_image_selection(tmp_path, monk
 
 
 def test_resumed_pending_verifier_slot_retries_once_with_same_digest_and_tracks_uncertain_usage(tmp_path):
-    from visforge.cycle import _verifier_for_phase
+    from visforge.cycle import _external_calls_by_phase
 
     state, request = {"observer_attempt": 1}, {"text": "Blind question"}
     def lost(req):
         raise KeyboardInterrupt()
     with pytest.raises(KeyboardInterrupt):
-        _verifier_for_phase(tmp_path, state, lost)("development")(request)
+        _external_calls_by_phase(tmp_path, state, lost, "verifier")("development")(request)
     seen = []
     def restored(req):
         seen.append(req)
         return "answer", {"model": "verifier", "usage": {"prompt_tokens": 3}}
-    resumed = _verifier_for_phase(tmp_path, state, restored)
+    resumed = _external_calls_by_phase(tmp_path, state, restored, "verifier")
     with pytest.raises(ValueError, match="Request changed"):
         resumed("development")({"text": "A different question"})
     assert resumed("development")(request)[0] == "answer"

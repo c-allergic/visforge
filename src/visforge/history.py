@@ -92,8 +92,15 @@ def observer_history(history, initial):
     parent = library_version(initial)
     ordered = sorted(reversed(history), key=lambda row: row["parent_version"] != parent)
     fields = ("run", "status", "reason", "edit", "metrics", "added_template", "templates", "composition_attempts")
-    notes = [{key: row[key] for key in fields if key in row}
-             for row in ordered[:6]]
+    notes = []
+    for row in ordered[:6]:
+        note = {key: row[key] for key in fields if key in row}
+        protocol = row["protocol"]
+        local = (protocol.get("model") or "").rsplit("/", 1)[-1]
+        target = protocol["settings"].get("target_model")
+        note["target_model"] = target or local
+        note["reference_model"] = local if target else protocol.get("verifier")
+        notes.append(note)
     return ("\nUse these prior outcomes to choose a different, testable change. "
             "Treat scores as evidence from the recorded run.\nPrior evolution results: "
             + json.dumps(notes, ensure_ascii=False))

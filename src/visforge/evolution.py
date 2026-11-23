@@ -353,7 +353,7 @@ def evaluate_library(library, seeds, settings, budget=None, *, drafts=None, on_e
             coverage[record["template"]] += 1
             family = "->".join(step["op"] for step in cand.plan[1:])
             family_coverage[family] += 1
-            if raw is None:
+            if raw is None or settings.get("deferred_target"):
                 answers, model_ids = _sample(view, solver, k)
                 emit("target_answer", {**identity, "answers": answers, "models": model_ids})
             else:

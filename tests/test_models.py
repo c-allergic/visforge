@@ -126,6 +126,24 @@ def test_cycle_verifier_uses_only_its_endpoint_key_and_model(monkeypatch, verifi
     assert (answer, metadata) == ("yes", {"model": "judge-v2", "usage": {}})
 
 
+def test_cycle_can_use_the_gateway_for_target_and_local_qwen_for_reference(monkeypatch, verifier_env, tmp_path):
+    sent = []
+
+    def urlopen(request, timeout):
+        sent.append(json.loads(request.data))
+        return io.BytesIO(b'{"model":"DeepSeek-V4.1-Flash","choices":[{"message":{"content":"42"}}]}')
+
+    monkeypatch.setattr(models.urllib.request, "urlopen", urlopen)
+    roles = models.build_cycle_models(tmp_path, target_model="DeepSeek-V4.1-Flash")
+    assert roles["reference"] is roles["synthesis"] is roles["observer"]
+    assert roles["target"] is not roles["verifier"]
+    assert roles["target"]({"text": "Count", "images": [Image.new("RGB", (2, 2))]})[0] == "42"
+    request, = sent
+    assert request["model"] == "DeepSeek-V4.1-Flash"
+    assert request["max_tokens"] == 4096 and "max_completion_tokens" not in request
+    assert request["messages"][0]["content"][1]["type"] == "image_url"
+
+
 def test_cycle_verifier_omits_service_error_details(monkeypatch, verifier_env, tmp_path):
     def urlopen(request, timeout):
         echoed = request.get_header("Authorization")

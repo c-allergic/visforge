@@ -82,7 +82,7 @@ def _split_rows(manifest, args):
     return sides
 
 
-def _prepare(args, out):
+def _prepare(args, out, target_model):
     manifest = Path(args.manifest).resolve(strict=True)
     instances = getattr(args, "instances_per_template", 3)
     if min(args.per_kind, args.budget, instances) < 1:
@@ -100,6 +100,8 @@ def _prepare(args, out):
         setup["holdout_mix"] = args.holdout_mix
     if args.reuse_development_for_comparison:
         setup["comparison_population"] = "in_sample"
+    if target_model:
+        setup["target_model"] = target_model
     prior = Path(args.resume_from).resolve() if args.resume_from else None
     statefile = out / "run.json"
     if statefile.exists():
@@ -157,6 +159,11 @@ def _prepare(args, out):
                  prior_run=str(prior) if prior is not None else None, initial_version=history.library_version(initial),
                  external_call_upper_bound=limit, external_call_bound_excludes_retries=True,
                  images={name: len(rows) for name, rows in sides.items()})
+    if target_model:
+        comparison_arms = 1 if args.reuse_development_for_comparison else 2
+        target_limit = attempts * (len(sides["development"]) + comparison_arms * len(sides["holdout"]))
+        # For each candidate, Luna can audit twice and judge up to two answer equivalences.
+        state.update(target_call_upper_bound=target_limit, external_call_upper_bound=5 * target_limit)
     _write_json(statefile, state)
     return state
 
@@ -218,6 +225,8 @@ def _draft_images(args, out, state, library, seeds, synthesis, target, phase):
                 _append_event(out, phase, "candidate", raw)
             for failure in image["failures"]:
                 _append_event(out, phase, "generation_failure", {"seed": image["seed"], **failure})
+        if target is None:
+            continue
         for raw in image["candidates"]:
             if "target_answers" in raw:
                 continue
@@ -289,12 +298,12 @@ def _frozen_baseline(out, state):
     return dev
 
 
-def _verifier_for_phase(out, state, model):
+def _external_calls_by_phase(out, state, model, role):
     """Persist completed paid calls. Repeated blind samples have separate phase/ordinal slots."""
-    folder = out / "verifier-calls" / f"attempt-{state['observer_attempt']}"
+    folder = out / f"{role}-calls" / f"attempt-{state['observer_attempt']}"
     keys = ("requests_attempted", "responses", "reported_prompt_tokens", "reported_completion_tokens",
             "unresolved_previous_attempts")
-    previous = state.get("verifier_usage_before_retry", dict.fromkeys(keys, 0))
+    previous = state.get(f"{role}_usage_before_retry", dict.fromkeys(keys, 0))
     current = dict.fromkeys(keys, 0)
     for path in folder.glob("*/*.json"):
         entry = json.loads(path.read_text())
@@ -304,14 +313,14 @@ def _verifier_for_phase(out, state, model):
             current["responses"] += 1
             for field in ("prompt_tokens", "completion_tokens"):
                 current[f"reported_{field}"] += entry["meta"]["usage"].get(field) or 0
-    state["verifier_usage_this_attempt"] = current
+    state[f"{role}_usage_this_attempt"] = current
     dispatched = set()
 
     def tally():
         totals = {key: previous.get(key, 0) + current[key] for key in keys}
         current["possible_unreported_usage"] = bool(current["unresolved_previous_attempts"])
         totals["possible_unreported_usage"] = bool(totals["unresolved_previous_attempts"])
-        state["verifier_usage"] = totals
+        state[f"{role}_usage"] = totals
         _write_json(out / "run.json", state)
 
     def scoped(phase):
@@ -328,11 +337,11 @@ def _verifier_for_phase(out, state, model):
             if path.exists():
                 entry = json.loads(path.read_text())
                 if entry["request_sha256"] != digest:
-                    raise ValueError(f"Request changed at {phase} verifier call {ordinal}; preserving its checkpoint.")
+                    raise ValueError(f"Request changed at {phase} {role} call {ordinal}; preserving its checkpoint.")
                 if entry["status"] == "complete":
                     return entry["text"], entry["meta"]
                 if path in dispatched:
-                    raise RuntimeError(f"{phase} verifier call {ordinal} already dispatched during this invocation.")
+                    raise RuntimeError(f"{phase} {role} call {ordinal} already dispatched during this invocation.")
                 if entry["status"] == "pending":
                     entry["unresolved_previous_attempts"] = entry.get("unresolved_previous_attempts", 0) + 1
                     entry["possible_unreported_usage"] = True
@@ -381,20 +390,27 @@ def _execute(args, out, state, roles, drafts, frozen=None):
     history_path = out / "initial-history.json"
     previous = json.loads(history_path.read_text()) if history_path.exists() else []
     holdout = load_seeds(out / "holdout.csv")
-    scoped_verifier = _verifier_for_phase(out, state, roles["verifier"])
+    external_target = bool(state["settings"].get("target_model"))
+    scoped_verifier = _external_calls_by_phase(out, state, roles["verifier"], "verifier")
+    scoped_target = _external_calls_by_phase(out, state, roles["target"], "target") if external_target else None
+    reference = roles["reference"] if external_target else roles["verifier"]
     settings = dict(model=roles["synthesis"], solver=roles["target"], min_coverage=1,
                     min_reference_accuracy=args.reference_floor, min_yield_per_image=args.yield_floor,
-                    k=1, instances_per_template=state["settings"]["instances_per_template"])
+                    k=1, instances_per_template=state["settings"]["instances_per_template"],
+                    deferred_target=external_target)
 
     def evaluate(phase, library, seeds, drafts, with_reference):
         verifier = scoped_verifier(phase)
+        target = scoped_target(phase) if scoped_target is not None else roles["target"]
+        reference_solver = reference if external_target else verifier
         return evolution.evaluate_library(
-            library, seeds, {**settings, "verifier": verifier, "judge": make_judge(verifier),
-                             "reference_solver": verifier if with_reference else None}, budget=args.budget,
+            library, seeds, {**settings, "solver": target, "verifier": verifier, "judge": make_judge(verifier),
+                             "reference_solver": reference_solver if with_reference else None}, budget=args.budget,
             drafts=drafts, on_event=lambda event, row: _append_event(out, phase, event, row))
     if frozen is None:
         development = load_seeds(out / "development.csv")
-        dev = evaluate("development", initial, development, drafts, args.reuse_development_for_comparison)
+        dev = evaluate("development", initial, development, drafts,
+                       external_target or args.reuse_development_for_comparison)
         _write_json(out / "development.json", dev)
         _write_dataset(out, "development.jsonl", dev)
     else:
@@ -436,10 +452,11 @@ def _execute(args, out, state, roles, drafts, frozen=None):
             candidate = evolution.apply_edit(initial, edit, budget=args.budget)
             _write_json(out / "candidate-library.json", candidate)
             def comparison_arm(phase, library):
-                arm_drafts = _draft_images(args, out, state, library, holdout, roles["synthesis"], roles["target"], phase)
+                draft_target = None if external_target else roles["target"]
+                arm_drafts = _draft_images(args, out, state, library, holdout, roles["synthesis"], draft_target, phase)
                 return evaluate(phase, library, holdout, arm_drafts, True)
 
-            settings["reference_solver"] = roles["verifier"]
+            settings["reference_solver"] = reference
             comparison = evolution.compare_libraries(
                 initial, candidate, holdout, settings, budget=args.budget,
                 baseline=dev if args.reuse_development_for_comparison else None,
@@ -467,6 +484,15 @@ def _execute(args, out, state, roles, drafts, frozen=None):
     _write_json(out / "run.json", state)
 
 
+def _target_model(args, out):
+    if args.target_model is not None:
+        return None if args.target_model == "local" else args.target_model
+    path = out / "run.json"
+    if path.exists():
+        return json.loads(path.read_text())["settings"].get("target_model")
+    return os.environ.get("VISFORGE_TARGET_MODEL") or None
+
+
 def run_cycle(args):
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -477,7 +503,9 @@ def run_cycle(args):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError("Another process is using this run directory.") from error
-        state = _prepare(args, out)
+        _load_env(Path(args.env_file))
+        target_model = _target_model(args, out)
+        state = _prepare(args, out, target_model)
         if not args.prepare_only:
             if not args.model_path:
                 raise ValueError("Provide --model-path for local GPU inference.")
@@ -488,7 +516,6 @@ def run_cycle(args):
                 local = models.make_local_model(args.model_path)
                 roles = {"synthesis": local, "target": local}
             else:
-                _load_env(Path(args.env_file))
                 verifier_id = args.verifier_model or os.environ.get("VISFORGE_VERIFIER_MODEL")
                 if state.get("verifier"):
                     verifier_id = verifier_id or state.get("verifier")
@@ -496,12 +523,14 @@ def run_cycle(args):
                         raise ValueError("Observer retry must use the same verifier model as the frozen baseline.")
                 roles = models.build_cycle_models(args.model_path, verifier_base_url=args.verifier_base_url,
                                                   verifier_model=verifier_id,
-                                                  verifier_api_key_env=args.verifier_key_env)
+                                                  verifier_api_key_env=args.verifier_key_env, target_model=target_model)
             frozen = None
             if args.retry_observer:
                 frozen = _frozen_baseline(out, state)
                 _archive_first_attempt(out)
                 state["verifier_usage_before_retry"] = state["verifier_usage"].copy()
+                if target_model:
+                    state["target_usage_before_retry"] = state["target_usage"].copy()
                 state.update(status="retrying_observer", observer_attempt=2)
             else:
                 if not args.draft_only and "development.json" in state["pinned_files"]:
@@ -513,14 +542,16 @@ def run_cycle(args):
                 drafts = None
                 if frozen is None:
                     initial = json.loads((out / "initial-library.json").read_text())
+                    draft_target = None if target_model else roles["target"]
                     drafts = _draft_images(args, out, state, initial, load_seeds(out / "development.csv"),
-                                           roles["synthesis"], roles["target"], "development")
+                                           roles["synthesis"], draft_target, "development")
                     if args.draft_only:
                         state["status"] = "drafted"
                         _write_json(out / "run.json", state)
                 if not args.draft_only:
-                    state.update(status="running", verifier=verifier_id,
-                                 reference_role="same verifier model, fresh blind call on comparison questions")
+                    reference_role = ("local synthesis checkpoint, separate blind call" if target_model
+                                      else "same verifier model, fresh blind call on comparison questions")
+                    state.update(status="running", verifier=verifier_id, reference_role=reference_role)
                     _write_json(out / "run.json", state)
                     _execute(args, out, state, roles, drafts, frozen=frozen)
             except BaseException as error:

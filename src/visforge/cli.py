@@ -118,7 +118,8 @@ def build_parser():
     p.add_argument("--resume-from", help="Start a new cycle from a completed run's selected library and proposal history")
     stage = p.add_mutually_exclusive_group()
     stage.add_argument("--prepare-only", action="store_true", help="Pin and check images without calling a model")
-    stage.add_argument("--draft-only", action="store_true", help="Save local development candidates and blind target answers")
+    stage.add_argument("--draft-only", action="store_true",
+                       help="Save local development candidates and, for a local target, blind answers")
     stage.add_argument("--retry-observer", action="store_true",
                        help="Retry an unusable observer response once using the frozen in-sample baseline")
     sample = p.add_mutually_exclusive_group()
@@ -134,6 +135,7 @@ def build_parser():
     p.add_argument("--yield-floor", type=float, default=0.5, help="Minimum accepted questions per held-out image")
     p.add_argument("--reference-floor", type=float, default=0.5, help="Minimum reference-solver accuracy on accepted questions")
     p.add_argument("--model-path", help="Local Qwen checkpoint on a GPU node")
+    p.add_argument("--target-model", help="External target model on the verifier gateway, or 'local' for the original roles")
     p.add_argument("--verifier-base-url", help="Defaults to VISFORGE_VERIFIER_API_BASE")
     p.add_argument("--verifier-model", help="Defaults to VISFORGE_VERIFIER_MODEL")
     p.add_argument("--verifier-key-env", default="VISFORGE_VERIFIER_API_KEY",

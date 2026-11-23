@@ -63,6 +63,7 @@ def respond(request, settings=None):
 
 
 def _chat_completion(request, s, *, private_errors=False):
+    role = s.get("role", "verifier")
     content = [{"type": "text", "text": request.get("text", "")}]
     for image in request.get("images") or []:
         content.append({"type": "image_url", "image_url": {"url": _encode_image(image)}})
@@ -90,23 +91,23 @@ def _chat_completion(request, s, *, private_errors=False):
     except urllib.error.HTTPError as exc:
         if private_errors:
             exc.close()
-            raise RuntimeError(f"verifier API returned HTTP {exc.code}") from None
+            raise RuntimeError(f"{role} API returned HTTP {exc.code}") from None
         detail = exc.read().decode("utf-8", "replace")[:300]
         raise RuntimeError(f"model API returned HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         if private_errors:
-            raise RuntimeError("verifier API unreachable") from None
+            raise RuntimeError(f"{role} API unreachable") from None
         raise RuntimeError(f"model API unreachable: {exc.reason}") from exc
-    text = _verifier_text(payload) if private_errors else payload["choices"][0]["message"]["content"]
+    text = _final_response_text(payload, role) if private_errors else payload["choices"][0]["message"]["content"]
     return text, {"model": payload.get("model", s["model"]), "usage": payload.get("usage", {})}
 
 
-def _verifier_text(payload):
+def _final_response_text(payload, role):
     try:
         choice = payload["choices"][0]
         text = choice["message"].get("content")
     except (KeyError, IndexError, TypeError, AttributeError):
-        raise RuntimeError("verifier API returned an invalid chat completion") from None
+        raise RuntimeError(f"{role} API returned an invalid chat completion") from None
     if isinstance(text, list):
         text = "".join(
             part["text"] for part in text if isinstance(part, dict)
@@ -115,8 +116,9 @@ def _verifier_text(payload):
     if isinstance(text, str) and text.strip():
         return text
     if choice.get("finish_reason") == "length":
-        raise RuntimeError("verifier hit its token limit before returning final text; increase VISFORGE_VERIFIER_MAX_TOKENS")
-    raise RuntimeError("verifier returned no final text")
+        raise RuntimeError(f"{role} hit its token limit before returning final text; "
+                           f"increase VISFORGE_{role.upper()}_MAX_TOKENS")
+    raise RuntimeError(f"{role} returned no final text")
 
 
 def make_model(settings=None):
@@ -147,6 +149,7 @@ def build_cycle_models(
     local_model_path, *, verifier_base_url=None, verifier_model=None,
     verifier_api_key_env="VISFORGE_VERIFIER_API_KEY", local_max_new_tokens=512,
     local_temperature=0.0, verifier_max_tokens=None, verifier_token_field=None, verifier_timeout=120,
+    target_model=None,
 ):
     """首轮三个本地角色共用一份权重。独立 verifier 仅读取自己的配置。"""
     base_url = verifier_base_url or os.environ.get("VISFORGE_VERIFIER_API_BASE")
@@ -166,24 +169,31 @@ def build_cycle_models(
     token_field = verifier_token_field or os.environ.get("VISFORGE_VERIFIER_TOKEN_FIELD", "max_completion_tokens")
     if token_field not in ("max_tokens", "max_completion_tokens"):
         raise ValueError("VISFORGE_VERIFIER_TOKEN_FIELD must be max_tokens or max_completion_tokens")
-    if verifier_max_tokens is None:
-        verifier_max_tokens = os.environ.get("VISFORGE_VERIFIER_MAX_TOKENS", "1024")
-    try:
-        max_tokens = int(verifier_max_tokens)
-    except (TypeError, ValueError):
-        raise ValueError("VISFORGE_VERIFIER_MAX_TOKENS must be a positive integer") from None
-    if max_tokens < 1:
-        raise ValueError("VISFORGE_VERIFIER_MAX_TOKENS must be a positive integer")
-    settings = {
-        "base_url": base_url, "model": model_id, "api_key": key,
-        "token_field": token_field, "max_tokens": max_tokens, "timeout": verifier_timeout,
-    }
+    def gateway_model(role, model_id, token_field, default_limit, explicit_limit=None):
+        limit_env = f"VISFORGE_{role.upper()}_MAX_TOKENS"
+        limit = explicit_limit if explicit_limit is not None else os.environ.get(limit_env, default_limit)
+        try:
+            max_tokens = int(limit)
+        except (TypeError, ValueError):
+            raise ValueError(f"{limit_env} must be a positive integer") from None
+        if max_tokens < 1:
+            raise ValueError(f"{limit_env} must be a positive integer")
+        settings = {
+            "base_url": base_url, "model": model_id, "api_key": key, "role": role,
+            "token_field": token_field, "max_tokens": max_tokens, "timeout": verifier_timeout,
+        }
 
-    def verifier(request):
-        return _chat_completion(request, settings, private_errors=True)
+        def call(request):
+            return _chat_completion(request, settings, private_errors=True)
 
+        return call
+
+    verifier = gateway_model("verifier", model_id, token_field, "1024", verifier_max_tokens)
     local = make_local_model(local_model_path, max_new_tokens=local_max_new_tokens, temperature=local_temperature)
-    return {"synthesis": local, "target": local, "observer": local, "verifier": verifier}
+    roles = {"synthesis": local, "target": local, "observer": local, "verifier": verifier, "reference": verifier}
+    if target_model:
+        roles.update(target=gateway_model("target", target_model, "max_tokens", "4096"), reference=local)
+    return roles
 
 
 def response_excerpt(text):
